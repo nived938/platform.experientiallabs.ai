@@ -1,6 +1,12 @@
 import {NextResponse} from "next/server";
 
-const MODEL = "z-ai/glm-5.2:free";
+const PRIMARY_MODEL = "z-ai/glm-5.2:free";
+const FALLBACK_MODELS = [
+  "openrouter/free",
+  "meta-llama/llama-3.3-70b-instruct:free",
+  "qwen/qwen3-coder:free",
+  "openai/gpt-oss-120b:free"
+];
 
 export async function POST(req){
   const key=process.env.OPENROUTER_API_KEY;
@@ -23,60 +29,86 @@ export async function POST(req){
       content:String(m.content)
     }));
 
-    const res=await fetch("https://openrouter.ai/api/v1/chat/completions",{
-      method:"POST",
-      headers:{
-        "Authorization":"Bearer "+key,
-        "Content-Type":"application/json",
-        "HTTP-Referer":"https://platform.experientiallabs.ai",
-        "X-Title":"Experiential AI Chat"
-      },
-      body:JSON.stringify({
-        model:MODEL,
-        messages:clean,
-        stream:false
-      })
-    });
+    const models=[PRIMARY_MODEL,...FALLBACK_MODELS];
+    let lastError=null;
 
-    const data=await res.json().catch(()=>({}));
+    for(let i=0;i<models.length;i++){
+      const model=models[i];
 
-    if(!res.ok){
-      if(res.status===429){
-        const retryAfter=res.headers.get("retry-after");
-        const wait=retryAfter
-          ? ` Try again in about ${retryAfter} seconds.`
-          : " Please wait and try again later.";
+      const res=await fetch("https://openrouter.ai/api/v1/chat/completions",{
+        method:"POST",
+        headers:{
+          "Authorization":"Bearer "+key,
+          "Content-Type":"application/json",
+          "HTTP-Referer":"https://platform.experientiallabs.ai",
+          "X-Title":"Experiential AI Chat"
+        },
+        body:JSON.stringify({
+          model,
+          messages:clean,
+          stream:false
+        })
+      });
+
+      const data=await res.json().catch(()=>({}));
+
+      if(res.ok){
+        const content=data?.choices?.[0]?.message?.content;
+
+        if(!content){
+          lastError={
+            error:"OpenRouter returned an empty response.",
+            model
+          };
+          continue;
+        }
 
         return NextResponse.json({
-          error:`OpenRouter rate limit reached for ${MODEL}.${wait} Free OpenRouter models have usage limits.`,
-          code:"RATE_LIMITED",
-          retryAfter:retryAfter||null,
-          model:MODEL
-        },{status:429});
+          content,
+          model,
+          usedFallback:i>0,
+          fallbackFrom:i>0?PRIMARY_MODEL:null,
+          usage:data?.usage||null,
+          requestId:res.headers.get("x-request-id")
+        });
       }
 
-      return NextResponse.json({
-        error:data?.error?.message||"OpenRouter request failed.",
-        code:data?.error?.code||"OPENROUTER_ERROR",
-        model:MODEL
-      },{status:res.status});
+      const providerError=data?.error?.message||"OpenRouter request failed.";
+      lastError={
+        error:providerError,
+        code:data?.error?.code||String(res.status),
+        model,
+        status:res.status,
+        retryAfter:res.headers.get("retry-after")
+      };
+
+      // Only fail over for temporary availability/rate-limit errors.
+      // Authentication, invalid requests, and other permanent errors should
+      // be shown immediately instead of sending the same invalid request
+      // to several models.
+      if(res.status!==429 && res.status!==408 && res.status!==502 && res.status!==503 && res.status!==504){
+        break;
+      }
     }
 
-    const content=data?.choices?.[0]?.message?.content;
+    if(lastError?.status===429){
+      const retryAfter=lastError.retryAfter;
+      const wait=retryAfter
+        ? ` Try again in about ${retryAfter} seconds.`
+        : " Please wait and try again later.";
 
-    if(!content){
       return NextResponse.json({
-        error:"OpenRouter returned an empty response.",
-        model:MODEL
-      },{status:502});
+        error:`All configured free OpenRouter models are currently rate limited.${wait}`,
+        code:"ALL_MODELS_RATE_LIMITED",
+        attemptedModels:models
+      },{status:429});
     }
 
     return NextResponse.json({
-      content,
-      model:MODEL,
-      usage:data?.usage||null,
-      requestId:res.headers.get("x-request-id")
-    });
+      error:lastError?.error||"All configured OpenRouter models failed.",
+      code:lastError?.code||"OPENROUTER_ERROR",
+      attemptedModels:models
+    },{status:lastError?.status||502});
   }catch(e){
     return NextResponse.json({
       error:e instanceof Error?e.message:"Unexpected server error."
